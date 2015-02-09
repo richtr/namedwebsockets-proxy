@@ -1,145 +1,214 @@
-package namedwebsockets
+package networkwebsockets
 
 import (
+	"encoding/json"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/richtr/websocket"
 )
 
 type PeerConnection struct {
 	// Unique identifier for this peer connection
-	id int
+	id string
+
+	// The Network Web Socket channel to which this peer connection belongs
+	channel *NetworkWebSocket
 
 	// WebSocket connection object
-	ws *websocket.Conn
+	conn *websocket.Conn
 }
 
-type Message struct {
-	// The source peer connection of the message
-	source int
-
-	// The destination peer connection id target
-	target int
-
-	// The message payload
-	payload string
-
-	// Whether this message originated from a ProxyConnection object
-	fromProxy bool
-}
-
-func NewPeerConnection(id int, socket *websocket.Conn) *PeerConnection {
+func NewPeerConnection(channel *NetworkWebSocket, conn *websocket.Conn) *PeerConnection {
 	peerConn := &PeerConnection{
-		id: id,
-		ws: socket,
+		id:      GenerateId(),
+		channel: channel,
+		conn:    conn,
 	}
+
+	// Start websocket read/write pumps
+	peerConn.Start()
 
 	return peerConn
 }
 
+func (peer *PeerConnection) Start() {
+	// Start connection read/write pumps
+	go peer.writeConnectionPump()
+	go peer.readConnectionPump()
+
+	// Add reference to this peer connection to channel
+	peer.addConnection()
+}
+
+func (peer *PeerConnection) SendBroadcast(data string) {
+	wsBroadcast := &NetworkWebSocketWireMessage{
+		Action:    "broadcast",
+		Source:    peer.id,
+		Target:    "", // target all connections
+		Payload:   data,
+		fromProxy: false,
+	}
+	peer.channel.broadcastBuffer <- wsBroadcast
+}
+
+func (peer *PeerConnection) SendMessage(data string, targetId string) {
+	if targetId == "" {
+		return
+	}
+
+	// Relay message to peer channel that matches target
+	for _, _peer := range peer.channel.peers {
+		if _peer.id == targetId {
+			_peer.send("message", peer.id, targetId, data)
+			return
+		}
+	}
+
+	// If we have not delivered the message yet then hunt for a
+	// proxy that owns target peer id in known proxies
+	for _, proxy := range peer.channel.proxies {
+		if proxy.peerIds[targetId] {
+			proxy.send("message", peer.id, targetId, data)
+			return
+		}
+	}
+}
+
 // Send a message to the target websocket connection
-func (conn *PeerConnection) send(payload string) {
-	conn.ws.SetWriteDeadline(time.Now().Add(writeWait))
-	conn.ws.WriteMessage(websocket.TextMessage, []byte(payload))
+func (peer *PeerConnection) send(action string, source string, target string, payload string) {
+	// Construct proxy wire message
+	m := NetworkWebSocketWireMessage{
+		Action:  action,
+		Source:  source,
+		Target:  target,
+		Payload: payload,
+	}
+	messagePayload, err := json.Marshal(m)
+	if err != nil {
+		return
+	}
+
+	peer.conn.SetWriteDeadline(time.Now().Add(writeWait))
+	peer.conn.WriteMessage(websocket.TextMessage, messagePayload)
 }
 
 // readConnectionPump pumps messages from an individual websocket connection to the dispatcher
-func (peer *PeerConnection) readConnectionPump(sock *NamedWebSocket) {
+func (peer *PeerConnection) readConnectionPump() {
 	defer func() {
-		peer.removeConnection(sock)
+		peer.Stop()
 	}()
-	peer.ws.SetReadLimit(maxMessageSize)
-	peer.ws.SetReadDeadline(time.Now().Add(pongWait))
-	peer.ws.SetPongHandler(func(string) error { peer.ws.SetReadDeadline(time.Now().Add(pongWait)); return nil })
+	peer.conn.SetReadLimit(maxMessageSize)
+	peer.conn.SetReadDeadline(time.Now().Add(pongWait))
+	peer.conn.SetPongHandler(func(string) error { peer.conn.SetReadDeadline(time.Now().Add(pongWait)); return nil })
 	for {
-		opCode, message, err := peer.ws.ReadMessage()
+		opCode, buf, err := peer.conn.ReadMessage()
 		if err != nil || opCode != websocket.TextMessage {
 			break
 		}
 
-		wsBroadcast := &Message{
-			source:    peer.id,
-			target:    0, // target all connections
-			payload:   string(message),
-			fromProxy: false,
+		var message NetworkWebSocketWireMessage
+		if err := json.Unmarshal(buf, &message); err != nil {
+			continue // ignore unrecognized message format
 		}
 
-		sock.broadcastBuffer <- wsBroadcast
+		switch message.Action {
+		// 'connect' and 'disconnect' events are write-only so will not be handled here
+
+		case "status":
+
+			// Echo peer id back to callee
+			peer.send("status", peer.id, peer.id, "")
+
+		case "broadcast":
+
+			peer.SendBroadcast(string(message.Payload))
+
+		case "message":
+
+			peer.SendMessage(string(message.Payload), message.Target)
+
+		}
+
 	}
 }
 
 // writeConnectionPump keeps an individual websocket connection alive
-func (peer *PeerConnection) writeConnectionPump(sock *NamedWebSocket) {
+func (peer *PeerConnection) writeConnectionPump() {
 	ticker := time.NewTicker(pingPeriod)
 	defer func() {
 		ticker.Stop()
-		peer.removeConnection(sock)
 	}()
 	for {
 		select {
 		case <-ticker.C:
-			peer.ws.SetWriteDeadline(time.Now().Add(writeWait))
-			peer.ws.WriteMessage(websocket.PingMessage, []byte{})
+			peer.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := peer.conn.WriteMessage(websocket.PingMessage, []byte{}); err != nil {
+				return
+			}
 		}
 	}
 }
 
-// Set up a new NamedWebSocket connection instance
-func (peer *PeerConnection) addConnection(sock *NamedWebSocket) {
+// Set up a new NetworkWebSocket connection instance
+func (peer *PeerConnection) addConnection() {
 	// Add this websocket instance to Named WebSocket broadcast list
-	sock.peers = append(sock.peers, peer)
+	peer.channel.peers = append(peer.channel.peers, peer)
 
-	// Inform all control connections that we now own this peer connection
-	for _, control := range sock.controllers {
-		// don't notify controller if its id matches the peer's id
-		if control.id != peer.id {
-			control.send("connect", control.id, peer.id, "")
+	for _, _peer := range peer.channel.peers {
+		if _peer.id != peer.id {
+			// Inform other local peer connections that we now own this peer
+			_peer.send("connect", _peer.id, peer.id, "")
+
+			// Inform this peer of all the other peer connections we own
+			peer.send("connect", peer.id, _peer.id, "")
 		}
 	}
 
-	// Inform all proxy connections that we now own this peer connection
-	for _, proxy := range sock.proxies {
+	for _, proxy := range peer.channel.proxies {
+		// Inform all proxy connections that we now own this peer connection
 		if proxy.writeable {
-			proxy.send("connect", proxy.id, peer.id, "")
+			proxy.send("connect", proxy.base.id, peer.id, "")
+		}
+		// Inform current peer of all the peer connections other connected proxies own
+		for peerId, _ := range proxy.peerIds {
+			peer.send("connect", proxy.base.id, peerId, "")
 		}
 	}
-
-	// Start connection read/write pumps
-	go peer.writeConnectionPump(sock)
-	go peer.readConnectionPump(sock)
 }
 
-// Tear down an existing NamedWebSocket connection instance
-func (peer *PeerConnection) removeConnection(sock *NamedWebSocket) {
-	for i, conn := range sock.peers {
+// Tear down an existing NetworkWebSocket connection instance
+func (peer *PeerConnection) removeConnection() {
+	for i, conn := range peer.channel.peers {
 		if conn.id == peer.id {
-			sock.peers = append(sock.peers[:i], sock.peers[i+1:]...)
+			peer.channel.peers = append(peer.channel.peers[:i], peer.channel.peers[i+1:]...)
 			break
 		}
 	}
 
-	// Find associated control connection and close also
-	for _, control := range sock.controllers {
-		if control.id == peer.id {
-			control.removeConnection(sock)
-			break
-		}
-	}
-
-	// Inform all control connections that we no longer own this peer connection
-	for _, control := range sock.controllers {
-		// don't notify controller if its id matches the peer's id
-		if control.id != peer.id {
-			control.send("disconnect", control.id, peer.id, "")
+	// Inform all local peer connections that we no longer own this peer connection
+	for _, _peer := range peer.channel.peers {
+		// don't notify peer if its id matches the peer's id
+		if _peer.id != peer.id {
+			_peer.send("disconnect", _peer.id, peer.id, "")
 		}
 	}
 
 	// Inform all proxy connections that we no longer own this peer connection
-	for _, proxy := range sock.proxies {
+	for _, proxy := range peer.channel.proxies {
 		if proxy.writeable {
-			proxy.send("disconnect", proxy.id, peer.id, "")
+			proxy.send("disconnect", proxy.base.id, peer.id, "")
 		}
 	}
 
-	peer.ws.Close()
+	peer.conn.Close()
+
+	// If no more local peers are connected then remove the current Named Web Socket service
+	if len(peer.channel.peers) == 0 {
+		peer.channel.Stop()
+	}
+}
+
+func (peer *PeerConnection) Stop() {
+	// Remove references to this peer connection from channel
+	peer.removeConnection()
 }

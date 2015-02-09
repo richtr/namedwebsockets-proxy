@@ -3,7 +3,7 @@
  * Basic Publish/Subscribe library for Named WebSockets
  * ------------------------------------------------------------------------
  * ------------------------------------------------------------------------
- * https://github.com/namedwebsockets/proxy/tree/master/examples/pubsub
+ * https://github.com/namedwebsockets/namedwebsockets/tree/master/examples/pubsub
  * ------------------------------------------------------------------------
  *
  * For an example of usage, please see `pubsub.html`.
@@ -14,8 +14,8 @@ var NamedWS_PubSubHub = function(namedWebSocketObj) {
 	this.ws.addEventListener("open", function() {
 		for(var msg in this.sendQueue) {
 			this.ws.send(this.sendQueue[msg]);
-			this.sendQueue = [];
 		}
+		this.sendQueue = [];
 	}.bind(this));
 
 	this.topicSubscriptions = [];

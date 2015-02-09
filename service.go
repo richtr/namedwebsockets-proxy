@@ -1,154 +1,329 @@
-package namedwebsockets
+package networkwebsockets
 
 import (
 	"fmt"
 	"log"
+	"math/rand"
+	"net"
 	"net/http"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"text/template"
+	"time"
+
+	tls "github.com/richtr/go-tls-srp"
 )
 
 var (
-	// Master list of all Named WebSocket services (local or broadcast) that we are aware of
-	namedWebSockets = map[string]*NamedWebSocket{}
+	// Proxy path matchers
+	serviceNameRegexStr  = "[A-Za-z0-9\\+=\\*\\._-]{1,255}"
+	isValidCreateRequest = regexp.MustCompile(fmt.Sprintf("^/%s$", serviceNameRegexStr))
+	isValidProxyRequest  = regexp.MustCompile(fmt.Sprintf("^/%s$", serviceNameRegexStr))
 
-	// Regular expression matchers
-
-	serviceNameRegexStr = "[A-Za-z0-9\\._-]{1,255}"
-
-	peerIdRegexStr = "[0-9]{4,}"
-
-	isBroadcastRequest = regexp.MustCompile(fmt.Sprintf("^(.*/broadcast/%s/%s)$", serviceNameRegexStr, peerIdRegexStr))
-
-	isControlRequest = regexp.MustCompile(fmt.Sprintf("(/control/(broadcast|local)/%s/%s)", serviceNameRegexStr, peerIdRegexStr))
-
-	isValidServiceName = regexp.MustCompile(fmt.Sprintf("^%s$", serviceNameRegexStr))
+	// TLS-SRP configuration components
+	Salt       = []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07}
+	serviceTab = CredentialsStore(map[string]string{})
 )
 
-type NamedWebSocket_Service struct {
-	Host string
-	Port int
+// Generate a new random identifier
+func GenerateId() string {
+	rand.Seed(time.Now().UTC().UnixNano())
+	return fmt.Sprintf("%d", rand.Int())
 }
 
-func (service *NamedWebSocket_Service) StartHTTPServer() {
+type NetworkWebSocket_Service struct {
+	Host string
+	Port int
+
+	ProxyPort int
+
+	// All Named Web Socket channels that this service manages
+	Channels map[string]*NetworkWebSocket
+
+	discoveryBrowser *DiscoveryBrowser
+
+	done chan int // blocks until .Stop() is called on this service
+}
+
+func NewNetworkWebSocketService(host string, port int) *NetworkWebSocket_Service {
+	if host == "" {
+		hostname, err := os.Hostname()
+		if err != nil {
+			log.Printf("Could not determine device hostname: %v\n", err)
+			return nil
+		}
+		host = hostname
+	}
+
+	if port <= 1024 || port >= 65534 {
+		port = 9009
+	}
+
+	service := &NetworkWebSocket_Service{
+		Host: host,
+		Port: port,
+
+		ProxyPort: 0,
+
+		Channels: make(map[string]*NetworkWebSocket),
+
+		discoveryBrowser: NewDiscoveryBrowser(),
+
+		done: make(chan int),
+	}
+
+	return service
+}
+
+func (service *NetworkWebSocket_Service) Start() <-chan int {
+	// Start HTTP/Network Web Socket creation server
+	service.StartHTTPServer()
+
+	// Start TLS-SRP Network Web Socket (wss) proxy server
+	service.StartProxyServer()
+
+	// Start mDNS/DNS-SD Network Web Socket discovery service
+	service.StartDiscoveryBrowser(10, 2)
+
+	return service.StopNotify()
+}
+
+func (service *NetworkWebSocket_Service) StartHTTPServer() {
 	// Create a new custom http server multiplexer
 	serveMux := http.NewServeMux()
 
-	// Serve the test console
-	serveMux.HandleFunc("/", service.serveConsoleTemplate)
+	// Serve network web socket creation endpoints for localhost clients
+	serveMux.HandleFunc("/", service.serveWSCreatorRequest)
 
-	// Serve the web socket creation endpoints
-	serveMux.HandleFunc("/local/", service.serveWSCreator)
-	serveMux.HandleFunc("/broadcast/", service.serveWSCreator)
-	serveMux.HandleFunc("/control/", service.serveWSCreator)
-
-	log.Printf("Serving Named WebSockets Proxy at http://%s:%d/", service.Host, service.Port)
-	log.Printf("(test console available @ http://localhost:%d/console)", service.Port)
-
-	// Listen and serve on all ports (public + loopback addresses)
-	if err := http.ListenAndServe(fmt.Sprintf(":%d", service.Port), serveMux); err != nil {
-		log.Fatal("Could not serve proxy. ", err)
-	}
-}
-
-func (service *NamedWebSocket_Service) StartNewDiscoveryServer() {
-	discoveryServer := &DiscoveryServer{
-		Host: service.Host,
-		Port: service.Port,
-	}
-
-	defer discoveryServer.Shutdown()
-
-	log.Print("Listening for broadcast websocket advertisements in local network...")
-
-	for !discoveryServer.closed {
-		discoveryServer.Browse()
-	}
-}
-
-func (service *NamedWebSocket_Service) serveConsoleTemplate(w http.ResponseWriter, r *http.Request) {
-
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-
-	if r.Method != "GET" {
-		http.Error(w, "Method not allowed", 405)
-		return
-	}
-
-	if r.URL.Path == "/" {
-		fmt.Fprint(w, "<h2>A Named WebSockets Proxy is running on this host</h2>")
-		return
-	}
-
-	if r.URL.Path != "/console" {
-		http.Error(w, "Not found", 404)
-		return
-	}
-
-	// Only allow console access from localhost
-	if r.Host != fmt.Sprintf("localhost:%d", service.Port) && r.Host != fmt.Sprintf("127.0.0.1:%d", service.Port) {
-		http.Error(w, fmt.Sprintf("Named WebSockets Test Console is only accessible from the local machine (i.e http://localhost:%d/console)", service.Port), 403)
-		return
-	}
-
-	consoleHTML, err := Asset("_templates/console.html")
+	// Listen and on loopback address + port
+	listener, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", service.Port))
 	if err != nil {
-		// Asset was not found.
-		http.Error(w, "Not found", 404)
-		return
+		log.Fatal("Could not serve web server. ", err)
 	}
 
-	t := template.Must(template.New("console").Parse(string(consoleHTML)))
-	if t == nil {
-		http.Error(w, "Internal server error", 501)
-		return
-	}
+	log.Printf("Serving Named Web Socket Creator Proxy at address [ ws://localhost:%d/ ]", service.Port)
 
-	t.Execute(w, service.Port)
+	go http.Serve(listener, serveMux)
 }
 
-func (service *NamedWebSocket_Service) serveWSCreator(w http.ResponseWriter, r *http.Request) {
+func (service *NetworkWebSocket_Service) StartProxyServer() {
+	// Create a new custom http server multiplexer
+	serveMux := http.NewServeMux()
+
+	// Serve secure network web socket proxy endpoints for network clients
+	serveMux.HandleFunc("/", service.serveWSProxyRequest)
+
+	// Generate random server salt for use in TLS-SRP data storage
+	var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+	b := make([]rune, 32)
+	for i := range b {
+		b[i] = letters[rand.Intn(len(letters))]
+	}
+	srpSaltKey := string(b)
+
+	tlsServerConfig := &tls.Config{
+		SRPLookup:   serviceTab,
+		SRPSaltKey:  srpSaltKey,
+		SRPSaltSize: len(Salt),
+	}
+
+	// Listen on all addresses + port
+	tlsSrpListener, err := tls.Listen("tcp", ":0", tlsServerConfig)
+	if err != nil {
+		log.Fatal("Could not serve proxy server. ", err)
+	}
+
+	// Obtain and store the port of the proxy endpoint
+	_, port, err := net.SplitHostPort(tlsSrpListener.Addr().String())
+	if err != nil {
+		log.Fatal("Could not determine bound port of proxy server. ", err)
+	}
+
+	service.ProxyPort, _ = strconv.Atoi(port)
+
+	log.Printf("Serving Named Web Socket Network Proxy at address [ wss://%s:%d/ ]", service.Host, service.ProxyPort)
+
+	go http.Serve(tlsSrpListener, serveMux)
+}
+
+func (service *NetworkWebSocket_Service) StartDiscoveryBrowser(intervalSeconds, timeoutSeconds int) {
+	log.Printf("Listening for Named Web Socket services on the local network...")
+
+	go func() {
+		defer service.discoveryBrowser.Shutdown()
+
+		for !service.discoveryBrowser.closed {
+			service.discoveryBrowser.Browse(service, intervalSeconds, timeoutSeconds)
+		}
+	}()
+}
+
+func (service *NetworkWebSocket_Service) serveWSCreatorRequest(w http.ResponseWriter, r *http.Request) {
+	// Only allow access from localhost to all services
+	if isRequestFromLocalHost := service.checkRequestIsFromLocalHost(r.Host); !isRequestFromLocalHost {
+		http.Error(w, fmt.Sprintln("This interface is only accessible from the local machine"), 403)
+		return
+	}
+
 	if r.Method != "GET" {
-		http.Error(w, "Method not allowed", 405)
+		http.Error(w, "Method Not Allowed", 405)
 		return
 	}
 
-	isBroadcast := isBroadcastRequest.MatchString(r.URL.Path)
-	isControl := isControlRequest.MatchString(r.URL.Path)
+	serviceName := strings.TrimPrefix(r.URL.Path, "/")
 
-	pathParts := strings.Split(r.URL.Path, "/")
+	// Serve console page for use in web browser if no service name has been requested
+	if serviceName == "" {
 
-	peerIdStr := pathParts[len(pathParts)-1]
-	serviceName := pathParts[len(pathParts)-2]
+		consoleHTML, err := Asset("_templates/console.html")
+		if err != nil {
+			// Asset was not found.
+			http.Error(w, "Not Found", 404)
+			return
+		}
 
-	// Remove trailing peerId from service path
-	servicePath := fmt.Sprintf("%s", strings.Join(pathParts[0:len(pathParts)-1], "/"))
+		t := template.Must(template.New("console").Parse(string(consoleHTML)))
+		if t == nil {
+			http.Error(w, "Internal Server Error", 501)
+			return
+		}
 
-	// Remove leading "/control" from service path if this is a control request
-	if isControl {
-		servicePath = fmt.Sprintf("/%s", strings.Join(pathParts[2:len(pathParts)-1], "/"))
-	}
+		t.Execute(w, service.Port)
 
-	if isValid := isValidServiceName.MatchString(serviceName); !isValid {
-		http.Error(w, "Not found", 404)
 		return
 	}
 
-	// Resolve websocket connection (also, split Local and Broadcast types with the same name)
-	sock := namedWebSockets[servicePath]
+	if isValidRequest := isValidCreateRequest.MatchString(r.URL.Path); !isValidRequest {
+		http.Error(w, "Not Found", 404)
+		return
+	}
+
+	if isValidWSUpgradeRequest := strings.ToLower(r.Header.Get("Upgrade")); isValidWSUpgradeRequest != "websocket" {
+		http.Error(w, "Bad Request", 400)
+		return
+	}
+
+	// Resolve to network web socket channel
+	sock := service.GetChannelByName(serviceName)
 	if sock == nil {
-		sock = NewNamedWebSocket(serviceName, isBroadcast, service.Port)
-		namedWebSockets[servicePath] = sock
+		sock = NewNetworkWebSocket(service, serviceName)
+
+		// Trigger network service detection to speed up pairing (1)
+		go service.discoveryBrowser.Browse(service, 2, 2)
 	}
 
-	peerId, _ := strconv.Atoi(peerIdStr)
+	// Serve network web socket channel peer
+	sock.ServePeer(w, r)
+}
 
-	// Handle websocket connection
-	if isControl {
-		sock.serveControl(w, r, peerId)
-	} else {
-		sock.serveService(w, r, peerId)
+func (service *NetworkWebSocket_Service) serveWSProxyRequest(w http.ResponseWriter, r *http.Request) {
+
+	if r.Method != "GET" {
+		http.Error(w, "Method Not Allowed", 405)
+		return
 	}
+
+	if isValidRequest := isValidProxyRequest.MatchString(r.URL.Path); !isValidRequest {
+		http.Error(w, "Not Found", 404)
+		return
+	}
+
+	if isValidWSUpgradeRequest := strings.ToLower(r.Header.Get("Upgrade")); isValidWSUpgradeRequest != "websocket" {
+		http.Error(w, "Bad Request", 400)
+		return
+	}
+
+	// Resolve servicePath to an active named websocket service
+	for _, sock := range service.Channels {
+		if sock.proxyPath == r.URL.Path {
+			sock.ServeProxy(w, r)
+
+			// Trigger network service detection to speed up pairing (2)
+			go service.discoveryBrowser.Browse(service, 2, 2)
+
+			return
+		}
+	}
+
+	http.Error(w, "Not Found", 404)
+	return
+}
+
+// Check whether we know the given service name
+func (service *NetworkWebSocket_Service) GetChannelByName(serviceName string) *NetworkWebSocket {
+	for _, sock := range service.Channels {
+		if sock.serviceName == serviceName {
+			return sock
+		}
+	}
+	return nil
+}
+
+// Check whether a DNS-SD derived Network Web Socket hash is owned by the current proxy instance
+func (service *NetworkWebSocket_Service) isOwnProxyService(serviceRecord *NetworkWebSocket_DNSRecord) bool {
+	for _, sock := range service.Channels {
+		if sock.serviceHash == serviceRecord.Hash_Base64 {
+			return true
+		}
+	}
+	return false
+}
+
+// Check whether a DNS-SD derived Network Web Socket hash is currently connected as a service
+func (service *NetworkWebSocket_Service) isActiveProxyService(serviceRecord *NetworkWebSocket_DNSRecord) bool {
+	for _, sock := range service.Channels {
+		for _, proxy := range sock.proxies {
+			if proxy.Hash_Base64 == serviceRecord.Hash_Base64 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// Stop stops the server gracefully, and shuts down the running goroutine.
+// Stop should be called after a Start(s), otherwise it will block forever.
+func (service *NetworkWebSocket_Service) Stop() {
+	service.done <- 1
+}
+
+// StopNotify returns a channel that receives a empty integer
+// when the server is stopped.
+func (service *NetworkWebSocket_Service) StopNotify() <-chan int { return service.done }
+
+//
+// HELPER FUNCTIONS
+//
+
+func (service *NetworkWebSocket_Service) checkRequestIsFromLocalHost(host string) bool {
+	allowedLocalHosts := map[string]bool{
+		fmt.Sprintf("localhost:%d", service.Port):        true,
+		fmt.Sprintf("127.0.0.1:%d", service.Port):        true,
+		fmt.Sprintf("::1:%d", service.Port):              true,
+		fmt.Sprintf("%s:%d", service.Host, service.Port): true,
+	}
+
+	if allowedLocalHosts[host] {
+		return true
+	}
+
+	return false
+}
+
+/** Simple in-memory storage table for TLS-SRP usernames/passwords **/
+
+type CredentialsStore map[string]string
+
+func (cs CredentialsStore) Lookup(user string) (v, s []byte, grp tls.SRPGroup, err error) {
+	grp = tls.SRPGroup4096
+
+	p := cs[user]
+	if p == "" {
+		return nil, nil, grp, nil
+	}
+
+	v = tls.SRPVerifier(user, p, Salt, grp)
+	return v, Salt, grp, nil
 }
